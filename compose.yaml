@@ -1,0 +1,369 @@
+name: power-forecast-pipeline
+
+x-airflow-common: &airflow-common
+  image: power-forecast-pipeline-airflow
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION:-3.1.7}
+  env_file: .env
+  environment: &airflow-environment
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USERNAME}:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/logs/simple_auth_manager_passwords.json
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@postgres/airflow
+    INGESTION_API_URL: http://ingestion-api:8000
+    SPARK_DRIVER_API_URL: http://spark-driver-api:8001
+    HDFS_URI: ${HDFS_URI:-hdfs://namenode:9000}
+    GIT_COMMIT: ${GIT_COMMIT:-unknown}
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - airflow_logs:/opt/airflow/logs
+  networks:
+    - control_plane
+    - data_plane
+  security_opt:
+    - no-new-privileges:true
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+x-hadoop-common: &hadoop-common
+  image: apache/hadoop:${HADOOP_VERSION:-3.5.0}
+  networks:
+    - data_plane
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+    - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+
+x-spark-common: &spark-common
+  image: spark:${SPARK_VERSION:-3.5.7}-scala2.12-java17-python3-ubuntu
+  networks:
+    - data_plane
+  security_opt:
+    - no-new-privileges:true
+  environment:
+    HADOOP_CONF_DIR: /opt/hadoop/conf
+    SPARK_NO_DAEMONIZE: "true"
+    GIT_COMMIT: ${GIT_COMMIT:-unknown}
+  volumes:
+    - ./hadoop:/opt/hadoop/conf:ro
+    - ./src/power_pipeline/spark_transform.py:/opt/pipeline/spark_transform.py:ro
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16-alpine}
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - control_plane
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  hdfs-storage-init:
+    image: apache/hadoop:${HADOOP_VERSION:-3.5.0}
+    user: "0:0"
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        install -d -o 1001 -g 100 -m 0750 /data/name /data/data-1 /data/data-2
+        chown -R 1001:100 /data/name /data/data-1 /data/data-2
+    volumes:
+      - namenode_data:/data/name
+      - datanode_1_data:/data/data-1
+      - datanode_2_data:/data/data-2
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  ingestion-storage-init:
+    image: power-forecast-pipeline-ingestion-api
+    user: "0:0"
+    entrypoint: /bin/sh
+    command: ["-ec", "chown -R 10001:10001 /var/cache/power-pipeline && chmod 0750 /var/cache/power-pipeline"]
+    volumes:
+      - source_cache:/var/cache/power-pipeline
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  namenode:
+    <<: *hadoop-common
+    hostname: namenode
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        if [ ! -d /data/name/current ]; then
+          hdfs namenode -format -nonInteractive -force
+        fi
+        exec hdfs namenode
+    volumes:
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - namenode_data:/data/name
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=NameNodeStatus >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    depends_on:
+      hdfs-storage-init:
+        condition: service_completed_successfully
+
+  datanode-1:
+    <<: *hadoop-common
+    hostname: datanode-1
+    command: ["/bin/bash", "-ec", "exec hdfs datanode"]
+    volumes:
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - datanode_1_data:/data/data
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  datanode-2:
+    <<: *hadoop-common
+    hostname: datanode-2
+    command: ["/bin/bash", "-ec", "exec hdfs datanode"]
+    volumes:
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - datanode_2_data:/data/data
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  hdfs-init:
+    <<: *hadoop-common
+    restart: "no"
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        hdfs dfs -mkdir -p /data/raw /data/curated /data/ml_ready /data/governance /data/quarantine
+        hdfs dfs -mkdir -p /data/_staging/ingestion /data/_staging/spark
+        hdfs dfs -chown ingestion:dataeng /data/raw /data/quarantine
+        hdfs dfs -chown spark:dataeng /data/curated /data/ml_ready /data/governance
+        hdfs dfs -chown ingestion:dataeng /data/_staging/ingestion
+        hdfs dfs -chown spark:dataeng /data/_staging/spark
+        hdfs dfs -chmod 755 /data/raw /data/curated /data/ml_ready /data/governance
+        hdfs dfs -chmod 700 /data/quarantine /data/_staging/ingestion /data/_staging/spark
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode-1:
+        condition: service_started
+      datanode-2:
+        condition: service_started
+
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/conf
+      SPARK_NO_DAEMONIZE: "true"
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    profiles: ["scale"]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8082"
+      - spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-driver-api:
+    image: power-forecast-pipeline-spark-driver-api
+    build:
+      context: .
+      dockerfile: docker/spark-driver/Dockerfile
+      args:
+        SPARK_VERSION: ${SPARK_VERSION:-3.5.7}
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/conf
+      HDFS_URI: ${HDFS_URI:-hdfs://namenode:9000}
+      SPARK_MASTER_URL: spark://spark-master:7077
+      MAX_NULL_RATIO: ${MAX_NULL_RATIO:-0.05}
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    volumes:
+      - ./hadoop:/opt/hadoop/conf:ro
+      - ./src/power_pipeline/spark_transform.py:/opt/pipeline/spark_transform.py:ro
+    networks:
+      - data_plane
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m,mode=1770
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-worker-1:
+        condition: service_started
+
+  ingestion-api:
+    image: power-forecast-pipeline-ingestion-api
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+      target: runtime
+    env_file: .env
+    environment:
+      WEBHDFS_URL: ${WEBHDFS_URL:-http://namenode:9870}
+      PIPELINE_LOG_LEVEL: ${PIPELINE_LOG_LEVEL:-INFO}
+    volumes:
+      - source_cache:/var/cache/power-pipeline
+    networks:
+      - data_plane
+      - source_egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+      ingestion-storage-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    user: "0:0"
+    entrypoint: /bin/bash
+    command: ["/opt/airflow/init.sh"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./docker/airflow/init.sh:/opt/airflow/init.sh:ro
+      - airflow_logs:/opt/airflow/logs
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      ingestion-api:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      spark-driver-api:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      ingestion-api:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      spark-driver-api:
+        condition: service_healthy
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+networks:
+  control_plane:
+    internal: true
+  data_plane:
+    internal: true
+  source_egress: {}
+
+volumes:
+  postgres_data:
+  namenode_data:
+  datanode_1_data:
+  datanode_2_data:
+  source_cache:
+  airflow_logs:

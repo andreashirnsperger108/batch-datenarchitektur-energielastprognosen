@@ -1,0 +1,17 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+secrets/*.txt
+airflow/logs/
+data/cache/
+data/local/
+build/
+dist/
+*.egg-info/
+_phase1_review/
+
