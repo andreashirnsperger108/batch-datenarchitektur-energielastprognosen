@@ -95,7 +95,10 @@ def typed_source(spark: SparkSession, raw_path: str) -> DataFrame:
     )
     typed = source.withColumn(
         "timestamp",
-        F.to_timestamp(F.concat_ws(" ", F.col("Date"), F.col("Time")), "dd/MM/yyyy HH:mm:ss"),
+        # The UCI source does not zero-pad single-digit days or months (for example
+        # ``1/1/2007``). A single ``d``/``M`` accepts both padded and unpadded values
+        # with Spark's strict datetime parser.
+        F.to_timestamp(F.concat_ws(" ", F.col("Date"), F.col("Time")), "d/M/yyyy HH:mm:ss"),
     )
     for column in NUMERIC_COLUMNS:
         typed = typed.withColumn(

@@ -309,6 +309,10 @@ services:
   airflow-api-server:
     <<: *airflow-common
     command: api-server
+    networks:
+      - control_plane
+      - data_plane
+      - default
     ports:
       - "127.0.0.1:8080:8080"
     healthcheck:
