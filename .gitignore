@@ -13,7 +13,5 @@ data/local/
 build/
 dist/
 *.egg-info/
-_phase1_review/
 _docx_work/
 exports/
-

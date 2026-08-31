@@ -1,8 +1,7 @@
 # Batch-Datenarchitektur für Energielastprognosen
 
-Dieses Repository implementiert Phase 2 des IU-Portfolioprojekts `DLMDWWDE02`. Die Pipeline
-überführt den UCI-Datensatz **Individual Household Electric Power Consumption** in geprüfte,
-versionierte und ML-bereite Batch-Daten.
+Die Pipeline überführt den UCI-Datensatz **Individual Household Electric Power Consumption** in
+geprüfte, versionierte und ML-bereite Batch-Daten.
 
 ## Architektur
 
@@ -26,11 +25,6 @@ Die ML-Anwendung selbst ist entsprechend der Aufgabenstellung nicht Bestandteil 
 - Docker Desktop: <https://www.docker.com/products/docker-desktop/>
 - Docker Compose v2.14 oder neuer (in Docker Desktop enthalten)
 - Git: <https://git-scm.com/downloads>
-- Für die spätere Remote-Abgabe ein GitHub-Konto: <https://github.com/signup>
-
-Für Airflow, Spark, Hadoop und den UCI-Download ist keine Registrierung erforderlich. Docker
-Hub kann ohne Anmeldung genutzt werden; ein Konto ist nur bei anonymen Pull-Limits nötig:
-<https://hub.docker.com/signup>.
 
 Empfohlen sind mindestens 8 GB für Docker Desktop. Standardmäßig startet nur ein Spark-Worker;
 der zweite Worker ist ein bewusst zuschaltbarer Skalierungstest.
@@ -50,15 +44,16 @@ Die Airflow-Oberfläche ist anschließend ausschließlich lokal unter
 generierte Passwort steht in der lokalen, von Git ignorierten `.env`-Datei.
 
 Der DAG heißt `power_forecast_monthly`. Er ist nach der Initialisierung absichtlich pausiert.
-Ein isolierter Smoke-Test lässt sich ohne Aktivierung des historischen Catch-ups ausführen:
+Ein einzelner Monatslauf kann in der Airflow-Oberfläche über **Auslösen** mit einer
+Laufkonfiguration gestartet werden, zum Beispiel:
 
-```powershell
-docker compose exec airflow-scheduler airflow dags test power_forecast_monthly 2006-12-01 `
-  -c '{"year": 2006, "month": 12}'
+```json
+{"year": 2007, "month": 3}
 ```
 
-Erst danach sollte der historische Catch-up-Lauf aktiviert werden. Der DAG verarbeitet wegen
-`max_active_runs=1` höchstens einen Monat gleichzeitig.
+Manuelle Läufe sind auch bei pausiertem DAG möglich. Wird der DAG über den Schalter neben seinem
+Namen aktiviert, plant Airflow wegen `catchup=True` alle ausstehenden historischen Monatsläufe
+automatisch. Durch `max_active_runs=1` wird höchstens ein Monatslauf gleichzeitig verarbeitet.
 
 ## Skalierungstest
 
@@ -88,13 +83,29 @@ den einmaligen Download des rund 20 MB großen UCI-Archivs.
 /data/curated/hourly/year=YYYY/month=MM/batch_id=...
 /data/curated/daily/year=YYYY/month=MM/batch_id=...
 /data/ml_ready/snapshot=YYYY-Qn/version=...
-/data/governance/batches/batch_id=...
+/data/governance/batches/<batch_id>
 /data/quarantine/year=YYYY/month=MM/...
 ```
+
+`YYYY` bezeichnet das vierstellige Jahr, `MM` den zweistelligen Monat einschließlich führender
+Null und `Qn` das Quartal, beispielsweise `year=2007/month=03` und `snapshot=2007-Q1`.
 
 Ein Batch wird zuerst unter `/data/_staging` geschrieben und erst nach bestandenem Quality Gate
 atomar veröffentlicht. Gleiche Eingaben erzeugen dieselbe `batch_id`; ein erneuter Lauf ist ein
 nachweisbarer No-op.
+
+## Nachgewiesene Ergebnisse
+
+Reale Airflow-Läufe bestätigten die Ende-zu-Ende-Verarbeitung:
+
+- Februar 2007: 40.320 Minutenmessungen, 672 Stunden- und 28 Tagesaggregate,
+- März 2007: 44.640 Minutenmessungen, 744 Stunden- und 31 Tagesaggregate,
+- nach dem März-Lauf automatisch erzeugter ML-ready Snapshot `2007-Q1`,
+- erfolgreiche Ausführung der fünf DAG-Tasks `source_check`, `ingest_month`, `raw_quality_gate`,
+  `spark_transform` und `record_lineage`.
+
+Aus HDFS heruntergeladene Beispieldaten werden lokal unter `exports/` abgelegt und nicht
+versioniert.
 
 ## Datenqualitätsregeln
 
@@ -132,6 +143,18 @@ rollierende Kennzahlen basieren ebenfalls ausschließlich auf vergangenen Zeitpu
 
 Weitere Begründungen stehen in [Architekturentscheidungen](docs/architecture-decisions.md) und
 [Implementierungsrisiken](docs/implementation-risks.md).
+
+## Projektstruktur
+
+```text
+airflow/dags/       Airflow-DAG und Orchestrierung
+src/power_pipeline/ Ingestion, Datenqualität, HDFS-Zugriff und Spark-Transformation
+docker/             Dockerfiles der selbst entwickelten Dienste
+hadoop/             HDFS-Konfiguration
+scripts/            Aufbau, Initialisierung und automatisierte Prüfungen
+tests/              Unit-Tests
+docs/               Architekturentscheidungen und Implementierungsrisiken
+```
 
 ## Datenquelle und Lizenz
 
